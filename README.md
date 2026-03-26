@@ -232,6 +232,12 @@ TARGET_TRIPLE=x86_64-unknown-linux-gnu ./_scripts/package-target.sh
 
 如果以后真要做控制指令、远程操作、双向通信，再上 WebSocket 也不晚。
 
+## 灵感感谢
+
+[https://github.com/meorionel/am-i-okay]([https://linux.do/](https://github.com/meorionel/am-i-okay))
+
+
+
 ## 社区
 
 [LINUX DO](https://linux.do/)
@@ -239,7 +245,4 @@ TARGET_TRIPLE=x86_64-unknown-linux-gnu ./_scripts/package-target.sh
 ## 许可证
 
 GNU
-
-
-
 
