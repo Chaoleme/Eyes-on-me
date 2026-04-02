@@ -3,6 +3,8 @@ name = "client-server"
 version = "0.1.0"
 edition = "2024"
 build = "build.rs"
+license = "LicenseRef-EyesOnMe-Personal-NonCommercial-Copyleft-1.0"
+license-file = "../LICENSE"
 
 [dependencies]
 eyes-on-me-shared = { path = "../shared" }

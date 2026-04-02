@@ -306,6 +306,17 @@ If we need to do control commands, remote operations, bidirectional communicatio
 
 [LINUX DO](https://linux.do/)
 
-## 许可证
+## License
 
-GNU
+This project no longer uses GPL.
+
+It is now released under the custom license in the repository root:
+
+- Only natural persons may use, copy, modify, and distribute it for personal, non-commercial purposes
+- If you modify it, distribute it, or deploy it for others to use over a network, you must provide the corresponding source code
+- Derivative works must remain under the same license
+- Any commercial use, internal company use, client work, paid service, SaaS, deployment, or support requires separate written commercial authorization
+
+This means the project is `source-available`, not an OSI-approved open source project.
+
+See [LICENSE](/Users/wong/Code/RustLang/Eyes_on_me/LICENSE) for the full terms.

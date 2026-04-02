@@ -302,4 +302,15 @@ TARGET_TRIPLE=x86_64-unknown-linux-gnu ./_scripts/package-target.sh
 
 ## 许可证
 
-GNU
+本项目不再使用 GPL。
+
+当前采用的是仓库根目录中的自定义许可证：
+
+- 仅允许自然人以个人、非商用目的使用、复制、修改和分发
+- 只要你修改、分发，或把它部署成可供他人通过网络使用的服务，就必须公开对应源码
+- 你的衍生版本必须继续使用同一份许可证
+- 任何商用、公司内部使用、客户项目、付费服务、SaaS、代部署、代运维，都必须另行获得书面商业授权
+
+这意味着它是 `source-available`，不是 OSI 定义下的“开源许可证”。
+
+具体条款见根目录的 [LICENSE](/Users/wong/Code/RustLang/Eyes_on_me/LICENSE)。
