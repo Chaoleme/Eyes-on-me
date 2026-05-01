@@ -19,6 +19,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/api/current", get(get_current))
         .route("/api/devices", get(get_devices))
+        .route("/api/search/activities", get(search_activities))
         .route("/api/devices/{device_id}", get(get_device_detail))
         .route("/api/analysis", get(get_analysis_overview))
         .route(
@@ -55,6 +56,14 @@ struct Envelope<T> {
 #[derive(Debug, Deserialize, Default)]
 struct AnalysisQuery {
     range: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ActivitySearchQuery {
+    q: Option<String>,
+    device_id: Option<String>,
+    limit: Option<u16>,
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -121,6 +130,33 @@ async fn get_device_analysis(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+async fn search_activities(
+    Query(query): Query<ActivitySearchQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<eyes_on_me_shared::ActivitySearchResponse>, StatusCode> {
+    let search_query = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let device_id = query
+        .device_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let limit = query.limit.unwrap_or(25).clamp(1, 100) as i64;
+
+    state
+        .search_activities(search_query, device_id, limit)
+        .await
+        .map(Json)
+        .map_err(|err| {
+            error!(error = %err, query = search_query, device_id, "failed to search activities");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn post_activity(

@@ -16,6 +16,8 @@ mod platform;
 mod screen_lock;
 mod transport;
 
+const EVENT_CHANNEL_CAPACITY: usize = 256;
+
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[allow(dead_code)]
 const UNSUPPORTED_PLATFORM_NOTICE: &str =
@@ -39,7 +41,7 @@ async fn main() -> Result<()> {
         "agent starting"
     );
 
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
     let _transport_task = tokio::spawn(transport::run_transport(
         cfg.server_api_base_url.clone(),
@@ -47,6 +49,11 @@ async fn main() -> Result<()> {
         rx,
     ));
 
-    platform::run_foreground_watcher(cfg.device_id.clone(), cfg.agent_name.clone(), tx)?;
+    platform::run_foreground_watcher(
+        cfg.device_id.clone(),
+        cfg.agent_name.clone(),
+        cfg.capture_filters.clone(),
+        tx,
+    )?;
     Ok(())
 }

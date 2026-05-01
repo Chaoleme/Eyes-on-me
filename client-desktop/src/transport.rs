@@ -11,7 +11,7 @@ use crate::event::ActivityEnvelope;
 pub async fn run_transport(
     server_api_base_url: String,
     api_token: String,
-    mut rx: mpsc::UnboundedReceiver<ActivityEnvelope>,
+    mut rx: mpsc::Receiver<ActivityEnvelope>,
 ) -> Result<()> {
     let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
 
@@ -79,7 +79,7 @@ async fn send_event(
             endpoint = %endpoint,
             app_id = %event.payload.app.id,
             browser_name = event.payload.browser.as_ref().map(|browser| browser.name.as_str()).unwrap_or("n/a"),
-            pid = event.payload.app.pid,
+            pid = ?event.payload.app.pid,
             "event sent"
         );
         return Ok(());

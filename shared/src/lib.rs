@@ -203,6 +203,23 @@ pub struct DeviceAnalysisResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivitySearchHit {
+    pub activity: ActivityEvent,
+    pub snippet: Option<String>,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivitySearchResponse {
+    pub query: String,
+    pub device_id: Option<String>,
+    pub total: usize,
+    pub results: Vec<ActivitySearchHit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum StreamMessage {
     Snapshot(DashboardSnapshot),

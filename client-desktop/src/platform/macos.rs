@@ -14,8 +14,12 @@ use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSNotification, NSRunLoop};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::browser::{BrowserContext, detect_browser_context, page_signature};
+use crate::browser::{BrowserContext, detect_browser_context, is_browser_app, page_signature};
+use crate::config::CaptureFilters;
 use crate::event::{ActivityEnvelope, AppInfo};
+use crate::platform::{
+    apply_capture_filters, is_system_process, normalize_app_info, send_activity,
+};
 use crate::{idle, screen_lock};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
@@ -25,7 +29,7 @@ const FRONT_APP_DELIMITER: &str = "|||AMI|||";
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LastApp {
     bundle_id: String,
-    pid: i32,
+    pid: Option<u32>,
     page_signature: Option<String>,
 }
 
@@ -48,7 +52,8 @@ struct LastSentState {
 pub fn run_foreground_watcher(
     device_id: String,
     agent_name: String,
-    tx: mpsc::UnboundedSender<ActivityEnvelope>,
+    capture_filters: CaptureFilters,
+    tx: mpsc::Sender<ActivityEnvelope>,
 ) -> Result<()> {
     let last_sent = Arc::new(Mutex::new(None::<LastSentState>));
     let last_read_error_at = Arc::new(Mutex::new(None::<Instant>));
@@ -60,6 +65,7 @@ pub fn run_foreground_watcher(
         emit_sample(
             &device_id,
             &agent_name,
+            &capture_filters,
             &tx,
             &last_sent,
             &last_read_error_at,
@@ -67,6 +73,7 @@ pub fn run_foreground_watcher(
 
         let block_device_id = device_id.clone();
         let block_agent_name = agent_name.clone();
+        let block_capture_filters = capture_filters.clone();
         let block_tx = tx.clone();
         let block_last_sent = Arc::clone(&last_sent);
         let block_last_read_error_at = Arc::clone(&last_read_error_at);
@@ -74,6 +81,7 @@ pub fn run_foreground_watcher(
             emit_sample(
                 &block_device_id,
                 &block_agent_name,
+                &block_capture_filters,
                 &block_tx,
                 &block_last_sent,
                 &block_last_read_error_at,
@@ -99,6 +107,7 @@ pub fn run_foreground_watcher(
             emit_sample(
                 &device_id,
                 &agent_name,
+                &capture_filters,
                 &tx,
                 &last_sent,
                 &last_read_error_at,
@@ -110,7 +119,8 @@ pub fn run_foreground_watcher(
 fn emit_sample(
     device_id: &str,
     agent_name: &str,
-    tx: &mpsc::UnboundedSender<ActivityEnvelope>,
+    capture_filters: &CaptureFilters,
+    tx: &mpsc::Sender<ActivityEnvelope>,
     last_sent: &Arc<Mutex<Option<LastSentState>>>,
     last_read_error_at: &Arc<Mutex<Option<Instant>>>,
 ) {
@@ -139,31 +149,53 @@ fn emit_sample(
         return;
     }
 
-    let current = match current_foreground_app() {
-        Some(current) => {
-            *last_read_error_at.lock().expect("error mutex poisoned") = None;
-            current
+    let needs_full_snapshot = app_changed || previous.is_none();
+    let mut current = if needs_full_snapshot {
+        match current_foreground_app() {
+            Some(current) => {
+                *last_read_error_at.lock().expect("error mutex poisoned") = None;
+                current
+            }
+            None => {
+                throttle_read_error(last_read_error_at);
+                previous
+                    .as_ref()
+                    .map(previous_as_foreground)
+                    .unwrap_or_else(|| synthetic_foreground_app(presence))
+            }
         }
-        None => {
-            throttle_read_error(last_read_error_at);
-            previous
-                .as_ref()
-                .map(previous_as_foreground)
-                .unwrap_or_else(|| synthetic_foreground_app(presence))
-        }
+    } else {
+        previous
+            .as_ref()
+            .map(previous_as_foreground)
+            .unwrap_or_else(|| synthetic_foreground_app(presence))
+    };
+    if is_system_process(&current.app.name) {
+        current = synthetic_foreground_app(presence);
+    }
+
+    let browser = if app_changed || is_browser_app(&current.app) {
+        stabilize_browser_context(
+            detect_browser_context(&current.app, current.window_title.as_deref()),
+            previous.as_ref(),
+            &current.app,
+            current.window_title.as_deref(),
+        )
+    } else {
+        previous.as_ref().and_then(|state| state.browser.clone())
     };
 
-    let browser = stabilize_browser_context(
-        detect_browser_context(&current.app, current.window_title.as_deref()),
-        previous.as_ref(),
-        &current.app,
-        current.window_title.as_deref(),
+    let filtered = apply_capture_filters(
+        capture_filters,
+        current.app.clone(),
+        current.window_title.clone(),
+        browser,
     );
 
     let marker = LastApp {
-        bundle_id: current.app.id.clone(),
-        pid: current.app.pid,
-        page_signature: page_signature(browser.as_ref(), current.window_title.as_deref()),
+        bundle_id: filtered.app.id.clone(),
+        pid: filtered.app.pid,
+        page_signature: page_signature(filtered.browser.as_ref(), filtered.window_title.as_deref()),
     };
     let marker_changed = previous
         .as_ref()
@@ -184,9 +216,9 @@ fn emit_sample(
 
     if marker_changed || presence_changed {
         info!(
-            app_name = %current.app.name,
-            bundle_id = %current.app.id,
-            pid = current.app.pid,
+            app_name = %filtered.app.name,
+            bundle_id = %filtered.app.id,
+            pid = ?filtered.app.pid,
             presence = ?presence,
             kind,
             "activity sampled"
@@ -199,22 +231,21 @@ fn emit_sample(
         "macos",
         "nsworkspace",
         kind,
-        current.app.clone(),
-        current.window_title.clone(),
-        browser.clone(),
+        filtered.app.clone(),
+        filtered.window_title.clone(),
+        filtered.browser.clone(),
         presence,
     );
 
-    if let Err(err) = tx.send(event) {
-        warn!(error = %err, "event channel closed, dropping event");
+    if !send_activity(tx, event) {
         return;
     }
 
     *last_sent.lock().expect("snapshot mutex poisoned") = Some(LastSentState {
         marker,
-        app: current.app,
-        window_title: current.window_title,
-        browser,
+        app: filtered.app,
+        window_title: filtered.window_title,
+        browser: filtered.browser,
         presence,
         sent_at: now,
     });
@@ -342,21 +373,21 @@ fn app_from_running_app(
             .unwrap_or_else(|| bundle_id.clone())
     });
 
-    AppInfo {
+    normalize_app_info(AppInfo {
         id: bundle_id,
         name: name.clone(),
         title: Some(name),
-        pid,
-    }
+        pid: u32::try_from(pid).ok(),
+    })
 }
 
 fn fallback_app_info(app_name: String, pid: i32) -> AppInfo {
-    AppInfo {
+    normalize_app_info(AppInfo {
         id: format!("pid:{pid}"),
         name: app_name.clone(),
         title: Some(app_name),
-        pid,
-    }
+        pid: u32::try_from(pid).ok(),
+    })
 }
 
 fn stabilize_browser_context(
@@ -411,7 +442,7 @@ fn synthetic_foreground_app(presence: PresenceState) -> ForegroundApp {
             id: id.to_string(),
             name: name.to_string(),
             title: Some(name.to_string()),
-            pid: -1,
+            pid: None,
         },
         window_title: None,
     }

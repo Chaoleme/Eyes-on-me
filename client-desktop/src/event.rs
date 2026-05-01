@@ -36,7 +36,8 @@ pub struct AppInfo {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    pub pid: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 impl ActivityEnvelope {

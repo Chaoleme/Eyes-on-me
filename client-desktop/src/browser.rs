@@ -1,13 +1,19 @@
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
 use std::process::{Command, Output, Stdio};
 #[cfg(target_os = "windows")]
 use std::thread;
 #[cfg(target_os = "windows")]
 use std::time::{Duration, Instant};
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+use std::{env, fs};
 
 use serde::Serialize;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+use serde_json::Value;
 use url::Url;
 
 use crate::event::AppInfo;
@@ -178,6 +184,10 @@ pub fn detect_browser_context(app: &AppInfo, window_title: Option<&str>) -> Opti
     detect_browser_context_internal(app, window_title, None)
 }
 
+pub fn is_browser_app(app: &AppInfo) -> bool {
+    match_browser(app).is_some()
+}
+
 #[cfg(target_os = "windows")]
 pub fn detect_browser_context_for_window(
     app: &AppInfo,
@@ -204,7 +214,11 @@ fn detect_browser_context_internal(
 ) -> Option<BrowserContext> {
     let browser = match_browser(app)?;
 
-    let mut title = infer_page_title(window_title, browser);
+    let initial_title = infer_page_title(window_title, browser);
+    #[cfg(target_os = "macos")]
+    let mut title = initial_title;
+    #[cfg(not(target_os = "macos"))]
+    let title = initial_title;
     let mut url = None;
     let mut domain = None;
     let mut source = "window-title".to_string();
@@ -228,6 +242,18 @@ fn detect_browser_context_internal(
         domain = win_page.domain;
         source = win_page.source;
         confidence = win_page.confidence;
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if url.is_none() && browser.family == "firefox" {
+        if let Some(title_ref) = window_title {
+            if let Some(sessionstore_url) = firefox_family_session_store_url(&app.name, title_ref) {
+                domain = url_domain(&sessionstore_url);
+                url = Some(sessionstore_url);
+                source = "firefox-sessionstore".to_string();
+                confidence = confidence.max(0.94);
+            }
+        }
     }
 
     if url.is_none() {
@@ -881,4 +907,523 @@ fn clean_url(value: &str) -> Option<String> {
     }
 
     Url::parse(trimmed).ok().map(|url| url.to_string())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn firefox_family_session_store_url(app_name: &str, window_title: &str) -> Option<String> {
+    let app_lower = app_name.to_ascii_lowercase();
+    let base_dir = firefox_family_session_store_base_dir(&app_lower)?;
+    let ini_content = fs::read_to_string(base_dir.join("profiles.ini")).ok()?;
+    let profile_dir = firefox_family_profile_dir_from_ini(&base_dir, &ini_content)?;
+
+    for session_path in [
+        profile_dir
+            .join("sessionstore-backups")
+            .join("recovery.jsonlz4"),
+        profile_dir.join("sessionstore.jsonlz4"),
+    ] {
+        let Ok(raw) = fs::read(&session_path) else {
+            continue;
+        };
+        let Ok(decoded) = decode_mozlz4_bytes(&raw) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(&decoded) else {
+            continue;
+        };
+        if let Some(url) = extract_active_tab_url_from_session_store_value(&value, window_title) {
+            return Some(url);
+        }
+    }
+
+    None
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn firefox_family_session_store_base_dir(app_lower: &str) -> Option<PathBuf> {
+    let home_dir = home_dir()?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let app_support_dir = home_dir.join("Library").join("Application Support");
+        return if app_lower.contains("zen") {
+            Some(app_support_dir.join("Zen"))
+        } else if app_lower.contains("waterfox") {
+            Some(app_support_dir.join("Waterfox"))
+        } else if app_lower.contains("firefox") {
+            Some(app_support_dir.join("Firefox"))
+        } else {
+            None
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return if app_lower.contains("librewolf") {
+            Some(home_dir.join(".librewolf"))
+        } else if app_lower.contains("waterfox") {
+            Some(home_dir.join(".waterfox"))
+        } else if app_lower.contains("zen") {
+            Some(home_dir.join(".zen"))
+        } else if app_lower.contains("firefox") {
+            Some(home_dir.join(".mozilla").join("firefox"))
+        } else {
+            None
+        };
+    }
+
+    #[cfg(all(test, not(any(target_os = "macos", target_os = "linux"))))]
+    {
+        return if app_lower.contains("zen") {
+            Some(
+                home_dir
+                    .join("Library")
+                    .join("Application Support")
+                    .join("Zen"),
+            )
+        } else if app_lower.contains("waterfox") {
+            Some(
+                home_dir
+                    .join("Library")
+                    .join("Application Support")
+                    .join("Waterfox"),
+            )
+        } else if app_lower.contains("firefox") {
+            Some(
+                home_dir
+                    .join("Library")
+                    .join("Application Support")
+                    .join("Firefox"),
+            )
+        } else {
+            None
+        };
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", test)))]
+    None
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn firefox_family_profile_dir_from_ini(base_dir: &Path, ini_content: &str) -> Option<PathBuf> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SectionKind {
+        Other,
+        Install,
+        Profile,
+    }
+
+    let mut section = SectionKind::Other;
+    let mut install_default_path: Option<PathBuf> = None;
+    let mut profile_path: Option<String> = None;
+    let mut profile_is_relative = true;
+    let mut profile_is_default = false;
+    let mut default_profile_path: Option<PathBuf> = None;
+    let mut first_profile_path: Option<PathBuf> = None;
+
+    let finalize_profile = |profile_path: &mut Option<String>,
+                            profile_is_relative: &mut bool,
+                            profile_is_default: &mut bool,
+                            default_profile_path: &mut Option<PathBuf>,
+                            first_profile_path: &mut Option<PathBuf>| {
+        let Some(path) = profile_path.take() else {
+            *profile_is_relative = true;
+            *profile_is_default = false;
+            return;
+        };
+
+        let resolved = if *profile_is_relative {
+            base_dir.join(&path)
+        } else {
+            PathBuf::from(&path)
+        };
+
+        if first_profile_path.is_none() {
+            *first_profile_path = Some(resolved.clone());
+        }
+        if *profile_is_default {
+            *default_profile_path = Some(resolved);
+        }
+
+        *profile_is_relative = true;
+        *profile_is_default = false;
+    };
+
+    for raw_line in ini_content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+
+        if line.starts_with('[') && line.ends_with(']') {
+            if section == SectionKind::Profile {
+                finalize_profile(
+                    &mut profile_path,
+                    &mut profile_is_relative,
+                    &mut profile_is_default,
+                    &mut default_profile_path,
+                    &mut first_profile_path,
+                );
+            }
+
+            let section_name = &line[1..line.len() - 1];
+            section = if section_name.starts_with("Install") {
+                SectionKind::Install
+            } else if section_name.starts_with("Profile") {
+                SectionKind::Profile
+            } else {
+                SectionKind::Other
+            };
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+
+        match section {
+            SectionKind::Install if key == "Default" => {
+                install_default_path = Some(base_dir.join(value));
+            }
+            SectionKind::Profile => match key {
+                "Path" => profile_path = Some(value.to_string()),
+                "IsRelative" => profile_is_relative = value != "0",
+                "Default" => profile_is_default = value == "1",
+                _ => {}
+            },
+            SectionKind::Other | SectionKind::Install => {}
+        }
+    }
+
+    if section == SectionKind::Profile {
+        finalize_profile(
+            &mut profile_path,
+            &mut profile_is_relative,
+            &mut profile_is_default,
+            &mut default_profile_path,
+            &mut first_profile_path,
+        );
+    }
+
+    install_default_path
+        .or(default_profile_path)
+        .or(first_profile_path)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn decode_mozlz4_bytes(data: &[u8]) -> Result<Vec<u8>, String> {
+    const HEADER: &[u8; 8] = b"mozLz40\0";
+
+    if data.len() < 12 {
+        return Err("mozlz4 data too short".to_string());
+    }
+    if &data[..8] != HEADER {
+        return Err("invalid mozlz4 header".to_string());
+    }
+
+    let expected_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+    let src = &data[12..];
+    let mut out = Vec::with_capacity(expected_len);
+    let mut index = 0usize;
+
+    while index < src.len() {
+        let token = src[index];
+        index += 1;
+
+        let mut literal_len = (token >> 4) as usize;
+        if literal_len == 15 {
+            loop {
+                let extra = *src
+                    .get(index)
+                    .ok_or_else(|| "mozlz4 literal length overflow".to_string())?;
+                index += 1;
+                literal_len += extra as usize;
+                if extra != 255 {
+                    break;
+                }
+            }
+        }
+
+        let literal_end = index + literal_len;
+        if literal_end > src.len() {
+            return Err("mozlz4 literal block overflow".to_string());
+        }
+        out.extend_from_slice(&src[index..literal_end]);
+        index = literal_end;
+
+        if index >= src.len() {
+            break;
+        }
+
+        let offset = u16::from_le_bytes([
+            *src.get(index)
+                .ok_or_else(|| "mozlz4 offset overflow".to_string())?,
+            *src.get(index + 1)
+                .ok_or_else(|| "mozlz4 offset overflow".to_string())?,
+        ]) as usize;
+        index += 2;
+
+        if offset == 0 || offset > out.len() {
+            return Err("invalid mozlz4 offset".to_string());
+        }
+
+        let mut match_len = (token & 0x0F) as usize;
+        if match_len == 15 {
+            loop {
+                let extra = *src
+                    .get(index)
+                    .ok_or_else(|| "mozlz4 match length overflow".to_string())?;
+                index += 1;
+                match_len += extra as usize;
+                if extra != 255 {
+                    break;
+                }
+            }
+        }
+        match_len += 4;
+
+        let mut match_index = out.len() - offset;
+        for _ in 0..match_len {
+            let value = *out
+                .get(match_index)
+                .ok_or_else(|| "mozlz4 match reference overflow".to_string())?;
+            out.push(value);
+            match_index += 1;
+        }
+    }
+
+    if out.len() != expected_len {
+        return Err(format!(
+            "mozlz4 decoded length mismatch: expected={expected_len}, actual={}",
+            out.len()
+        ));
+    }
+
+    Ok(out)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn normalize_session_store_title(value: &str) -> String {
+    [
+        " - Mozilla Firefox",
+        " - Firefox",
+        " - Firefox Developer Edition",
+        " - Waterfox",
+        " - LibreWolf",
+        " - Zen Browser",
+        " - Zen",
+    ]
+    .into_iter()
+    .fold(value, |current, suffix| {
+        current.split(suffix).next().unwrap_or(current)
+    })
+    .trim()
+    .to_string()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn extract_active_tab_url_from_session_store_value(
+    value: &Value,
+    window_title: &str,
+) -> Option<String> {
+    let windows = value.get("windows")?.as_array()?;
+    if windows.is_empty() {
+        return None;
+    }
+
+    let selected_window_index = value
+        .get("selectedWindow")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(1)
+        .saturating_sub(1) as usize;
+    let normalized_window_title = normalize_session_store_title(window_title);
+    let mut best_match: Option<(i32, u64, String)> = None;
+
+    for (window_index, window) in windows.iter().enumerate() {
+        let Some(tabs) = window.get("tabs").and_then(|value| value.as_array()) else {
+            continue;
+        };
+
+        let selected_tab_index = window
+            .get("selected")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(1)
+            .saturating_sub(1) as usize;
+
+        for (tab_index, tab) in tabs.iter().enumerate() {
+            let Some(entries) = tab.get("entries").and_then(|value| value.as_array()) else {
+                continue;
+            };
+            if entries.is_empty() {
+                continue;
+            }
+
+            let selected_entry_index = tab
+                .get("index")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(1)
+                .saturating_sub(1) as usize;
+            let entry = entries
+                .get(selected_entry_index)
+                .or_else(|| entries.last())
+                .unwrap_or(&entries[0]);
+
+            let Some(raw_url) = entry.get("url").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(url) = normalize_possible_url(raw_url) else {
+                continue;
+            };
+
+            let entry_title = entry
+                .get("title")
+                .and_then(|value| value.as_str())
+                .map(normalize_session_store_title)
+                .unwrap_or_default();
+            let last_accessed = tab
+                .get("lastAccessed")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+
+            let mut score = 0;
+            if !normalized_window_title.is_empty() && !entry_title.is_empty() {
+                if entry_title == normalized_window_title {
+                    score += 1_000;
+                } else if entry_title.contains(&normalized_window_title)
+                    || normalized_window_title.contains(&entry_title)
+                {
+                    score += 600;
+                }
+            }
+            if window_index == selected_window_index {
+                score += 120;
+            }
+            if tab_index == selected_tab_index {
+                score += 80;
+            }
+            if !tab
+                .get("hidden")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                score += 20;
+            }
+            if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
+                score += 20;
+            }
+
+            let replace = best_match
+                .as_ref()
+                .map(|(best_score, best_last_accessed, _)| {
+                    score > *best_score
+                        || (score == *best_score && last_accessed > *best_last_accessed)
+                })
+                .unwrap_or(true);
+
+            if replace {
+                best_match = Some((score, last_accessed, url));
+            }
+        }
+    }
+
+    best_match.map(|(_, _, url)| url)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use serde_json::json;
+
+    use super::{
+        decode_mozlz4_bytes, extract_active_tab_url_from_session_store_value,
+        firefox_family_profile_dir_from_ini,
+    };
+
+    #[test]
+    fn decodes_mozlz4_literal_blocks() {
+        let data = [
+            b'm', b'o', b'z', b'L', b'z', b'4', b'0', 0, 5, 0, 0, 0, 0x50, b'h', b'e', b'l', b'l',
+            b'o',
+        ];
+
+        let decoded = decode_mozlz4_bytes(&data).expect("decode mozlz4");
+        assert_eq!(decoded, b"hello");
+    }
+
+    #[test]
+    fn decodes_mozlz4_match_blocks() {
+        let data = [
+            b'm', b'o', b'z', b'L', b'z', b'4', b'0', 0, 9, 0, 0, 0, 0x32, b'a', b'b', b'c', 0x03,
+            0x00,
+        ];
+
+        let decoded = decode_mozlz4_bytes(&data).expect("decode repeated sequence");
+        assert_eq!(decoded, b"abcabcabc");
+    }
+
+    #[test]
+    fn extracts_active_tab_url_from_sessionstore() {
+        let value = json!({
+            "selectedWindow": 1,
+            "windows": [
+                {
+                    "selected": 2,
+                    "tabs": [
+                        {
+                            "index": 1,
+                            "entries": [
+                                {"url": "https://example.com/older", "title": "旧页面"}
+                            ]
+                        },
+                        {
+                            "index": 2,
+                            "lastAccessed": 12345,
+                            "entries": [
+                                {"url": "https://example.com/step-1", "title": "步骤 1"},
+                                {"url": "https://example.com/final?q=1", "title": "最终页面"}
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let url =
+            extract_active_tab_url_from_session_store_value(&value, "最终页面 - Mozilla Firefox");
+
+        assert_eq!(url.as_deref(), Some("https://example.com/final?q=1"));
+    }
+
+    #[test]
+    fn resolves_default_profile_from_profiles_ini() {
+        let base_dir = Path::new("/tmp/Firefox");
+        let ini = r#"
+[Install123]
+Default=Profiles/install-default
+
+[Profile0]
+Name=default-release
+IsRelative=1
+Path=Profiles/first
+
+[Profile1]
+Name=work
+IsRelative=1
+Path=Profiles/default
+Default=1
+"#;
+
+        let profile_dir =
+            firefox_family_profile_dir_from_ini(base_dir, ini).expect("resolve profile dir");
+
+        assert_eq!(profile_dir, base_dir.join("Profiles/install-default"));
+    }
 }

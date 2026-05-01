@@ -4,10 +4,10 @@ use std::{
 };
 
 use eyes_on_me_shared::{
-    ActivityEvent, ActivityKind, AnalysisOverviewResponse, BrowserUsageBucket, DashboardSnapshot,
-    DeviceAnalysisResponse, DeviceAnalysisSummary, DeviceDetailResponse, DeviceOverview,
-    DeviceStatus, DevicesResponse, DomainUsageBucket, PageUsageBucket, PresenceState,
-    StreamMessage, UsageBucket,
+    ActivityEvent, ActivityKind, ActivitySearchResponse, AnalysisOverviewResponse,
+    BrowserUsageBucket, DashboardSnapshot, DeviceAnalysisResponse, DeviceAnalysisSummary,
+    DeviceDetailResponse, DeviceOverview, DeviceStatus, DevicesResponse, DomainUsageBucket,
+    PageUsageBucket, PresenceState, StreamMessage, UsageBucket,
 };
 use sqlx::SqlitePool;
 use time::{Duration as TimeDuration, OffsetDateTime, UtcOffset};
@@ -16,7 +16,7 @@ use tokio::sync::broadcast;
 const RECENT_ACTIVITY_LIMIT: usize = 20;
 const DEVICE_ACTIVITY_LIMIT: i64 = 50;
 const ANALYSIS_TOP_LIMIT: usize = 12;
-const MAX_ACTIVITY_CONTINUITY: TimeDuration = TimeDuration::seconds(30);
+const MAX_ACTIVITY_CONTINUITY: TimeDuration = TimeDuration::seconds(120);
 const WORKDAY_START_HOUR: i64 = 9;
 const WORKDAY_END_HOUR: i64 = 18;
 
@@ -297,6 +297,23 @@ impl AppState {
         )))
     }
 
+    pub async fn search_activities(
+        &self,
+        query: &str,
+        device_id: Option<&str>,
+        limit: i64,
+    ) -> anyhow::Result<ActivitySearchResponse> {
+        let results = crate::db::search_activities(&self.pool, query, device_id, limit).await?;
+        let total = crate::db::count_activity_search_results(&self.pool, query, device_id).await?;
+
+        Ok(ActivitySearchResponse {
+            query: query.to_string(),
+            device_id: device_id.map(str::to_string),
+            total: total.max(0) as usize,
+            results,
+        })
+    }
+
     fn broadcast_snapshot(&self, snapshot: DashboardSnapshot) {
         let _ = self.tx.send(StreamMessage::Snapshot(snapshot));
     }
@@ -376,9 +393,10 @@ fn build_device_analysis_payload(
     let mut work_tracked_ms = 0_u64;
     let mut browser_tracked_ms = 0_u64;
     let mut event_count = 0_usize;
-    let mut current_label = None;
     let window_start = range.window_start(now);
-    let local_offset = UtcOffset::current_local_offset().ok().unwrap_or(UtcOffset::UTC);
+    let local_offset = UtcOffset::current_local_offset()
+        .ok()
+        .unwrap_or(UtcOffset::UTC);
     let mut app_keys = HashSet::new();
 
     for (index, activity) in activities.iter().enumerate() {
@@ -399,10 +417,6 @@ fn build_device_analysis_payload(
             event_count += 1;
         }
 
-        if current_label.is_none() {
-            current_label = Some(current_activity_label(activity));
-        }
-
         if activity.presence != PresenceState::Active {
             continue;
         }
@@ -418,9 +432,12 @@ fn build_device_analysis_payload(
         app_keys.insert(app_usage_key(activity));
     }
 
-    if current_label.is_none() {
-        current_label = activities.last().map(current_activity_label);
-    }
+    let current_label = activities
+        .iter()
+        .rev()
+        .find(|activity| activity.presence == PresenceState::Active)
+        .map(current_activity_label)
+        .or_else(|| activities.last().map(current_activity_label));
 
     DeviceAnalysisResponse {
         device_id,
@@ -438,13 +455,16 @@ fn build_device_analysis_payload(
     }
 }
 
+#[cfg(test)]
 fn duration_within_window(
     start: OffsetDateTime,
     end: OffsetDateTime,
     window_start: Option<OffsetDateTime>,
     now: OffsetDateTime,
 ) -> u64 {
-    let Some((effective_start, effective_end)) = effective_segment_bounds(start, end, window_start, now) else {
+    let Some((effective_start, effective_end)) =
+        effective_segment_bounds(start, end, window_start, now)
+    else {
         return 0;
     };
     duration_between(effective_start, effective_end)
@@ -498,8 +518,10 @@ fn overlap_with_workday_for_date(
     start_local: OffsetDateTime,
     end_local: OffsetDateTime,
 ) -> u64 {
-    let work_start = date.midnight().assume_offset(start_local.offset()) + TimeDuration::hours(WORKDAY_START_HOUR);
-    let work_end = date.midnight().assume_offset(start_local.offset()) + TimeDuration::hours(WORKDAY_END_HOUR);
+    let work_start = date.midnight().assume_offset(start_local.offset())
+        + TimeDuration::hours(WORKDAY_START_HOUR);
+    let work_end =
+        date.midnight().assume_offset(start_local.offset()) + TimeDuration::hours(WORKDAY_END_HOUR);
     let effective_start = start_local.max(work_start);
     let effective_end = end_local.min(work_end);
 
@@ -920,7 +942,7 @@ mod tests {
 
     use super::{
         AnalysisRange, MAX_ACTIVITY_CONTINUITY, accumulate_app_usage, accumulate_browser_usage,
-        duration_within_window, finalize_browser_usage_map,
+        build_device_analysis_payload, duration_within_window, finalize_browser_usage_map,
     };
     use time::{Date, Duration as TimeDuration, Month, OffsetDateTime, UtcOffset};
 
@@ -1091,5 +1113,76 @@ mod tests {
             browsers[0].domains[0].pages[0].url.as_deref(),
             Some("https://docs.example.com/spec")
         );
+    }
+
+    #[test]
+    fn keeps_latest_active_activity_for_current_label() {
+        let now = OffsetDateTime::now_utc();
+        let activities = vec![
+            ActivityEvent {
+                event_id: "evt-older".to_string(),
+                ts: now - TimeDuration::minutes(5),
+                device_id: "mac-agent".to_string(),
+                agent_name: "client-desktop".to_string(),
+                platform: Platform::Macos,
+                kind: ActivityKind::ForegroundChanged,
+                app: ActivityApp {
+                    id: "com.google.Chrome".to_string(),
+                    name: "Google Chrome".to_string(),
+                    title: None,
+                    pid: Some(777),
+                },
+                window_title: Some("Older page".to_string()),
+                browser: None,
+                presence: PresenceState::Active,
+                source: "desktop".to_string(),
+            },
+            ActivityEvent {
+                event_id: "evt-newer".to_string(),
+                ts: now - TimeDuration::seconds(10),
+                device_id: "mac-agent".to_string(),
+                agent_name: "client-desktop".to_string(),
+                platform: Platform::Macos,
+                kind: ActivityKind::ForegroundChanged,
+                app: ActivityApp {
+                    id: "com.google.Chrome".to_string(),
+                    name: "Google Chrome".to_string(),
+                    title: None,
+                    pid: Some(777),
+                },
+                window_title: Some("Latest page".to_string()),
+                browser: None,
+                presence: PresenceState::Active,
+                source: "desktop".to_string(),
+            },
+            ActivityEvent {
+                event_id: "evt-idle".to_string(),
+                ts: now - TimeDuration::seconds(5),
+                device_id: "mac-agent".to_string(),
+                agent_name: "client-desktop".to_string(),
+                platform: Platform::Macos,
+                kind: ActivityKind::PresenceChanged,
+                app: ActivityApp {
+                    id: "com.google.Chrome".to_string(),
+                    name: "Google Chrome".to_string(),
+                    title: None,
+                    pid: Some(777),
+                },
+                window_title: Some("Idle page".to_string()),
+                browser: None,
+                presence: PresenceState::Idle,
+                source: "desktop".to_string(),
+            },
+        ];
+
+        let analysis = build_device_analysis_payload(
+            "mac-agent".to_string(),
+            None,
+            activities,
+            now,
+            AnalysisRange::All,
+        );
+
+        assert_eq!(analysis.current_label.as_deref(), Some("Latest page"));
     }
 }

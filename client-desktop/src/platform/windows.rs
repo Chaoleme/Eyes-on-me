@@ -16,7 +16,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::browser::{BrowserContext, detect_browser_context_for_window, page_signature};
+use crate::config::CaptureFilters;
 use crate::event::{ActivityEnvelope, AppInfo};
+use crate::platform::{
+    apply_capture_filters, is_system_process, normalize_app_info, send_activity,
+};
 use crate::{idle, screen_lock};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -25,7 +29,7 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LastApp {
     process_path: String,
-    pid: i32,
+    pid: Option<u32>,
     page_signature: Option<String>,
 }
 
@@ -49,14 +53,21 @@ struct LastSentState {
 pub fn run_foreground_watcher(
     device_id: String,
     agent_name: String,
-    tx: mpsc::UnboundedSender<ActivityEnvelope>,
+    capture_filters: CaptureFilters,
+    tx: mpsc::Sender<ActivityEnvelope>,
 ) -> Result<()> {
     info!("foreground watcher started (Windows polling sampler)");
 
     let mut last_sent: Option<LastSentState> = None;
 
     loop {
-        emit_sample(&device_id, &agent_name, &tx, &mut last_sent);
+        emit_sample(
+            &device_id,
+            &agent_name,
+            &capture_filters,
+            &tx,
+            &mut last_sent,
+        );
         thread::sleep(POLL_INTERVAL);
     }
 }
@@ -64,13 +75,17 @@ pub fn run_foreground_watcher(
 fn emit_sample(
     device_id: &str,
     agent_name: &str,
-    tx: &mpsc::UnboundedSender<ActivityEnvelope>,
+    capture_filters: &CaptureFilters,
+    tx: &mpsc::Sender<ActivityEnvelope>,
     last_sent: &mut Option<LastSentState>,
 ) {
     let presence = current_presence();
-    let current = current_foreground_app()
+    let mut current = current_foreground_app()
         .or_else(|| last_sent.as_ref().map(previous_as_foreground))
         .unwrap_or_else(|| synthetic_foreground_app(presence));
+    if is_system_process(&current.app.name) {
+        current = synthetic_foreground_app(presence);
+    }
 
     let browser = stabilize_browser_context(
         detect_browser_context_for_window(
@@ -83,10 +98,17 @@ fn emit_sample(
         current.window_title.as_deref(),
     );
 
+    let filtered = apply_capture_filters(
+        capture_filters,
+        current.app.clone(),
+        current.window_title.clone(),
+        browser,
+    );
+
     let marker = LastApp {
-        process_path: current.app.id.clone(),
-        pid: current.app.pid,
-        page_signature: page_signature(browser.as_ref(), current.window_title.as_deref()),
+        process_path: filtered.app.id.clone(),
+        pid: filtered.app.pid,
+        page_signature: page_signature(filtered.browser.as_ref(), filtered.window_title.as_deref()),
     };
 
     let now = Instant::now();
@@ -117,9 +139,9 @@ fn emit_sample(
 
     if marker_changed || presence_changed {
         info!(
-            app_name = %current.app.name,
-            process_path = %current.app.id,
-            pid = current.app.pid,
+            app_name = %filtered.app.name,
+            process_path = %filtered.app.id,
+            pid = ?filtered.app.pid,
             presence = ?presence,
             kind,
             "activity sampled"
@@ -132,22 +154,21 @@ fn emit_sample(
         "windows",
         "polling",
         kind,
-        current.app.clone(),
-        current.window_title.clone(),
-        browser.clone(),
+        filtered.app.clone(),
+        filtered.window_title.clone(),
+        filtered.browser.clone(),
         presence,
     );
 
-    if let Err(err) = tx.send(event) {
-        warn!(error = %err, "event channel closed, dropping event");
+    if !send_activity(tx, event) {
         return;
     }
 
     *last_sent = Some(LastSentState {
         marker,
-        app: current.app,
-        window_title: current.window_title,
-        browser,
+        app: filtered.app,
+        window_title: filtered.window_title,
+        browser: filtered.browser,
         presence,
         sent_at: now,
     });
@@ -179,12 +200,12 @@ fn current_foreground_app() -> Option<ForegroundApp> {
         .unwrap_or_else(|| format!("pid-{pid}"));
 
     Some(ForegroundApp {
-        app: AppInfo {
+        app: normalize_app_info(AppInfo {
             id: process_path,
             name: app_name,
             title: window_title(hwnd),
-            pid: i32::try_from(pid).unwrap_or(i32::MAX),
-        },
+            pid: Some(pid),
+        }),
         window_title: window_title(hwnd),
         hwnd: hwnd as isize,
     })
@@ -243,7 +264,7 @@ fn synthetic_foreground_app(presence: PresenceState) -> ForegroundApp {
             id: id.to_string(),
             name: name.to_string(),
             title: Some(name.to_string()),
-            pid: -1,
+            pid: None,
         },
         window_title: None,
         hwnd: 0,

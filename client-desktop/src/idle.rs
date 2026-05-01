@@ -61,5 +61,60 @@ fn get_idle_seconds() -> u64 {
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn get_idle_seconds() -> u64 {
-    0
+    use std::{env, process::Command};
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum LinuxDesktopSession {
+        Wayland,
+        X11,
+        Unknown,
+    }
+
+    let session = if env::var_os("WAYLAND_DISPLAY").is_some() {
+        LinuxDesktopSession::Wayland
+    } else if env::var_os("DISPLAY").is_some() {
+        LinuxDesktopSession::X11
+    } else {
+        LinuxDesktopSession::Unknown
+    };
+
+    if session == LinuxDesktopSession::Wayland {
+        let output = Command::new("dbus-send")
+            .args([
+                "--session",
+                "--print-reply",
+                "--dest=org.freedesktop.ScreenSaver",
+                "/org/freedesktop/ScreenSaver",
+                "org.freedesktop.ScreenSaver.GetSessionIdleTime",
+            ])
+            .output();
+
+        if let Ok(result) = output {
+            if result.status.success() {
+                let stdout = String::from_utf8_lossy(&result.stdout);
+                if let Some(idle_ms) = stdout
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .find_map(|parts| match parts {
+                        ["uint32", value] => value.parse::<u64>().ok(),
+                        ["uint64", value] => value.parse::<u64>().ok(),
+                        _ => None,
+                    })
+                {
+                    return idle_ms / 1000;
+                }
+            }
+        }
+    }
+
+    let output = Command::new("xprintidle").output();
+    match output {
+        Ok(result) if result.status.success() => String::from_utf8_lossy(&result.stdout)
+            .trim()
+            .parse::<u64>()
+            .map(|idle_ms| idle_ms / 1000)
+            .unwrap_or(0),
+        _ => 0,
+    }
 }
